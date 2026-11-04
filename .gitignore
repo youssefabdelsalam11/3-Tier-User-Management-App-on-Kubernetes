@@ -1,0 +1,4 @@
+*.tar
+K8s/mysql-secret.yaml
+.vscode/
+__pycache__/
