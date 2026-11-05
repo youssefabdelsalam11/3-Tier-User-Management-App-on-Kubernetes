@@ -1,18 +1,60 @@
 # 3-Tier User Management App on Kubernetes
 
-A user management web app (add, list, delete users) deployed as three containerized tiers on a 2-node **kubeadm** Kubernetes cluster with **Calico** networking.
+A small user management app (add, list, delete users) split into three containerized tiers and deployed on a **2-node kubeadm Kubernetes cluster** with **Calico** networking.
+
+![Kubernetes](https://img.shields.io/badge/Kubernetes-kubeadm-326CE5?logo=kubernetes&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-containers-2496ED?logo=docker&logoColor=white)
+![Flask](https://img.shields.io/badge/Backend-Flask-000000?logo=flask&logoColor=white)
+![MySQL](https://img.shields.io/badge/Database-MySQL%208.0-4479A1?logo=mysql&logoColor=white)
+![Nginx](https://img.shields.io/badge/Frontend-Nginx-009639?logo=nginx&logoColor=white)
+
+![User Management System UI](docs/app-ui.png)
+
+## Contents
+
+- [Architecture](#architecture)
+- [Screenshots](#screenshots)
+- [Tech stack](#tech-stack)
+- [What this project covers](#what-this-project-covers)
+- [Project structure](#project-structure)
+- [Prerequisites](#prerequisites)
+- [1. Build the images](#1-build-the-images)
+- [2. Configuration and secrets](#2-configuration-and-secrets)
+- [3. Deploy](#3-deploy)
+- [4. Access and test](#4-access-and-test)
+- [API endpoints](#api-endpoints)
+- [Troubleshooting](#troubleshooting)
+- [Cleanup](#cleanup)
+- [Known limitations and next steps](#known-limitations-and-next-steps)
+- [Author](#author)
+
+## Architecture
 
 ```
                  ┌────────────────────────── Kubernetes cluster ──────────────────────────┐
                  │                                                                          │
  Browser ──────► │  frontend Service ──► Nginx pods ──/api──► backend Service ──► Flask pods │
- (NodePort)      │                       (2 replicas)                            (2 replicas)│
+                 │                       (2 replicas)                            (2 replicas)│
                  │                                                                   │      │
                  │                                          mysql Service ◄──────────┘      │
                  │                                                │                         │
                  │                                          MySQL pod ──► PVC ──► PV        │
                  └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+The browser only ever talks to the frontend. Nginx serves the static page and proxies every `/api/*` request to the backend Service. In the manifests the backend Service is `ClusterIP`, so it is only reachable inside the cluster, and the database is only reachable from the backend through cluster DNS.
+
+## Screenshots
+
+The app UI is shown at the top. Below is the cluster state and the backend health check.
+
+**All pods, services and deployments running** (2 backend, 2 frontend, 1 database):
+
+![kubectl get all](docs/kubectl-get-all.png)
+
+**Backend health check** returning `connected` from the database (here the backend Service was temporarily switched to NodePort to call it directly):
+
+![API health check](docs/api-health.png)
 
 ## Tech stack
 
@@ -22,25 +64,35 @@ A user management web app (add, list, delete users) deployed as three containeri
 | Backend  | Python 3.10, Flask, Flask-CORS, mysql-connector    | `my-backend-app`                       |
 | Database | MySQL 8.0 with persistent storage                  | `mysql:8.0`                            |
 
+## What this project covers
+
+- Writing a Dockerfile for each tier and building the images
+- Deployments with multiple replicas, and Services for stable networking between tiers
+- Service discovery through cluster DNS (`backend`, `mysql`)
+- Configuration with ConfigMaps, and credentials with Secrets kept out of Git
+- Persistent storage with a PersistentVolume and PersistentVolumeClaim
+- Initializing a database from a ConfigMap mounted into `/docker-entrypoint-initdb.d/`
+- Debugging a real cluster: Calico, CoreDNS and firewall problems (see [Troubleshooting](#troubleshooting))
+
 ## Project structure
 
 ```
 .
 ├── backend/
-│   ├── app.py                  # Flask REST API
+│   ├── app.py                      # Flask REST API
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── database/
-│   └── init.sql                # Creates the users table and seed data
+│   └── init.sql                    # Creates the users table and seed data
 ├── frontend/
-│   ├── index.html              # UI
-│   ├── nginx.conf              # Serves the UI and proxies /api to the backend
+│   ├── index.html                  # UI
+│   ├── nginx.conf                  # Serves the UI and proxies /api to the backend
 │   └── Dockerfile
-└── k8s/
-    ├── app-config.yaml         # ConfigMap (DB host, port, name)
-    ├── mysql-secret.example.yaml   # Secret template (real one is git-ignored)
-    ├── my-pv.yaml              # PersistentVolume
-    ├── my-pvc.yaml             # PersistentVolumeClaim
+└── K8s/
+    ├── app-config.yaml             # ConfigMap (DB host, port, name)
+    ├── mysql-secret.example.yaml   # Secret template (the real one is git-ignored)
+    ├── my-pv.yaml                  # PersistentVolume
+    ├── my-pvc.yaml                 # PersistentVolumeClaim
     ├── database-deployment.yaml
     ├── database-svc.yaml
     ├── backend-deployment.yaml
@@ -49,20 +101,51 @@ A user management web app (add, list, delete users) deployed as three containeri
     └── frontend-svc.yaml
 ```
 
-## 1. Dockerized images
+## Prerequisites
 
-Each tier has its own Dockerfile.
+- A running Kubernetes cluster (this was built on 2 nodes with kubeadm and Calico)
+- `kubectl` configured to talk to it
+- Docker on the machine where you build the images
+- A Docker Hub account if you want to push the images
 
-**Frontend** (`frontend/Dockerfile`): Nginx serves `index.html` and forwards `/api/*` to the backend Service.
+## 1. Build the images
+
+```bash
+# Frontend (pushed to Docker Hub so every node can pull it)
+docker build -t youssefabdelsalllam1/my-frontend-app:latest ./frontend
+docker push youssefabdelsalllam1/my-frontend-app:latest
+
+# Backend (built locally; the Deployment uses imagePullPolicy: Never)
+docker build -t my-backend-app:latest ./backend
+```
+
+With `imagePullPolicy: Never`, the backend image must exist on **every node that can run the pod**. Either push it to a registry and remove `imagePullPolicy: Never` from the Deployment, or export and import it on each node:
+
+```bash
+docker save my-backend-app:latest -o backend.tar
+ctr -n k8s.io images import backend.tar     # run on each node
+```
+
+### How the Dockerfiles work
+
+**Frontend** serves the page with Nginx and forwards `/api/*` to the backend Service:
 
 ```dockerfile
 FROM nginx:alpine
-COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY index.html /usr/share/nginx/html/index.html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
 ```
 
-**Backend** (`backend/Dockerfile`): Flask API on port 5000.
+```nginx
+location /api/ {
+    proxy_pass http://backend:5000;   # the backend Service name, resolved by cluster DNS
+}
+```
+
+> Use the Service **name** here, not its ClusterIP. A ClusterIP changes if the Service is ever recreated, and the name does not.
+
+**Backend** runs the Flask API on port 5000:
 
 ```dockerfile
 FROM python:3.10-slim
@@ -74,52 +157,13 @@ EXPOSE 5000
 CMD ["python", "app.py"]
 ```
 
-**Database**: uses the official `mysql:8.0` image. The schema is loaded from `database/init.sql` through a ConfigMap (see below).
+**Database** uses the official `mysql:8.0` image. The schema comes from `database/init.sql` through a ConfigMap.
 
-### Build the images
-
-```bash
-# Frontend (pushed to Docker Hub so every node can pull it)
-docker build -t youssefabdelsalllam1/my-frontend-app:latest ./frontend
-docker push youssefabdelsalllam1/my-frontend-app:latest
-
-# Backend (built locally; the Deployment uses imagePullPolicy: Never)
-docker build -t my-backend-app:latest ./backend
-```
-
-If the cluster has more than one node, the backend image must exist on every node that can run it. Either push it to a registry and remove `imagePullPolicy: Never`, or export and import it per node:
-
-```bash
-docker save my-backend-app:latest -o backend.tar
-ctr -n k8s.io images import backend.tar     # run on each node
-```
-
-## 2. Deployments and Services
-
-Each component has a Deployment (runs the pods) and a Service (stable network endpoint).
-
-| Component | Deployment | Replicas                | Service    | Type                 | Port |
-| --------- | ---------- | ----------------------- | ---------- | -------------------- | ---- |
-| Frontend  | `frontend` | 2                       | `frontend` | NodePort             | 80   |
-| Backend   | `backend`  | 2                       | `backend`  | NodePort / ClusterIP | 5000 |
-| Database  | `db`       | 1 (`Recreate` strategy) | `mysql`    | ClusterIP            | 3306 |
-
-How they connect:
-
-- The browser talks only to the **frontend** Service.
-- Nginx forwards `/api/*` to `http://backend:5000`.
-- The backend reaches MySQL at `mysql:3306` through cluster DNS.
-- The database pod mounts a PersistentVolumeClaim at `/var/lib/mysql`, so data survives pod restarts.
-
-### Persistent storage
-
-`my-pv.yaml` defines a 1Gi `hostPath` volume at `/mnt/data`, and `my-pvc.yaml` claims it. This is suitable for a single-node lab. Use a real StorageClass in production.
-
-## 3. ConfigMaps and Secrets
+## 2. Configuration and secrets
 
 ### ConfigMap: application settings
 
-`k8s/app-config.yaml` holds non-sensitive settings, injected into the backend as environment variables:
+`K8s/app-config.yaml` holds non-sensitive settings, injected into the backend (and the database name into MySQL) as environment variables:
 
 ```yaml
 apiVersion: v1
@@ -142,15 +186,15 @@ kubectl create configmap mysql-init --from-file=database/init.sql
 
 ### Secret: database credentials
 
-Credentials are stored in a Kubernetes Secret and injected as `DB_USER` and `DB_PASSWORD` (backend) and `MYSQL_ROOT_PASSWORD` (database). The real `mysql-secret.yaml` is **not committed** (see `.gitignore`). Create your own from the template:
+Credentials live in a Kubernetes Secret and are injected as `DB_USER` and `DB_PASSWORD` (backend) and `MYSQL_ROOT_PASSWORD` (database). The real `mysql-secret.yaml` is **not committed** (see `.gitignore`). Create your own from the template:
 
 ```bash
-cp k8s/mysql-secret.example.yaml k8s/mysql-secret.yaml
+cp K8s/mysql-secret.example.yaml K8s/mysql-secret.yaml
 echo -n 'root' | base64             # use as username
 echo -n 'YourStrongPass' | base64   # use as password
 ```
 
-Or create it directly:
+Or create it directly without a file:
 
 ```bash
 kubectl create secret generic mysql-secret \
@@ -158,27 +202,29 @@ kubectl create secret generic mysql-secret \
   --from-literal=password='YourStrongPass'
 ```
 
-> Base64 is encoding, not encryption. For real environments use sealed secrets or an external secret manager.
+> Base64 is encoding, not encryption. For real environments use Sealed Secrets or an external secret manager.
 
-## Deploy
+## 3. Deploy
 
 Run from the repository root, in this order:
 
 ```bash
 # 1. Configuration
-kubectl apply -f k8s/app-config.yaml
-kubectl apply -f k8s/mysql-secret.yaml
+kubectl apply -f K8s/app-config.yaml
+kubectl apply -f K8s/mysql-secret.yaml
 kubectl create configmap mysql-init --from-file=database/init.sql
 
 # 2. Storage
-kubectl apply -f k8s/my-pv.yaml
-kubectl apply -f k8s/my-pvc.yaml
+kubectl apply -f K8s/my-pv.yaml
+kubectl apply -f K8s/my-pvc.yaml
 
 # 3. Database, then backend, then frontend
-kubectl apply -f k8s/database-deployment.yaml -f k8s/database-svc.yaml
-kubectl apply -f k8s/backend-deployment.yaml  -f k8s/backend-svc.yaml
-kubectl apply -f k8s/frontend-deployment.yaml -f k8s/frontend-svc.yaml
+kubectl apply -f K8s/database-deployment.yaml -f K8s/database-svc.yaml
+kubectl apply -f K8s/backend-deployment.yaml  -f K8s/backend-svc.yaml
+kubectl apply -f K8s/frontend-deployment.yaml -f K8s/frontend-svc.yaml
 ```
+
+> Apply files one by one as shown. Do not run `kubectl apply -f K8s/` on the whole folder: it would also try to apply the `.example` secret, which contains placeholder values.
 
 Check that everything is running:
 
@@ -186,24 +232,33 @@ Check that everything is running:
 kubectl get pods,svc,pvc
 ```
 
-## Access and test
+| Component | Deployment | Replicas                | Service    | Type      | Port |
+| --------- | ---------- | ----------------------- | ---------- | --------- | ---- |
+| Frontend  | `frontend` | 2                       | `frontend` | NodePort  | 80   |
+| Backend   | `backend`  | 2                       | `backend`  | ClusterIP | 5000 |
+| Database  | `db`       | 1 (`Recreate` strategy) | `mysql`    | ClusterIP | 3306 |
 
-Find the frontend NodePort:
+The database uses the `Recreate` strategy because two MySQL pods must never write to the same data directory at once.
+
+## 4. Access and test
+
+The frontend Service is of type `NodePort`, so it is reachable on any node's IP. Find the port:
 
 ```bash
 kubectl get svc frontend
+# 80:3XXXX/TCP  -> the port after the colon is the NodePort
 ```
 
-Open `http://<node-ip>:<frontend-nodeport>` in your browser. Test the API through the frontend:
+Open `http://<node-ip>:<nodeport>` in your browser, then test the API through the frontend:
 
 ```bash
-curl http://<node-ip>:<frontend-nodeport>/api/health
+curl http://<node-ip>:<nodeport>/api/health
 # {"database":"connected","status":"healthy"}
 
-curl http://<node-ip>:<frontend-nodeport>/api/users
+curl http://<node-ip>:<nodeport>/api/users
 ```
 
-Verify persistence by deleting the database pod and refreshing the page. The users should still be there:
+**Check persistence:** delete the database pod and refresh the page. The users should still be there.
 
 ```bash
 kubectl delete pod -l app=db
@@ -218,6 +273,16 @@ kubectl delete pod -l app=db
 | GET    | `/api/users`      | List users                                    |
 | POST   | `/api/users`      | Add a user (`name` and `email` required)      |
 | DELETE | `/api/users/<id>` | Delete a user                                 |
+
+Example:
+
+```bash
+curl -X POST http://<node-ip>:<nodeport>/api/users \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Sara Ali", "email": "sara@example.com", "role": "Developer"}'
+```
+
+Status codes: `201` created, `400` missing name or email, `404` user not found, `409` email already exists.
 
 ## Troubleshooting
 
@@ -242,14 +307,30 @@ kubectl get pods -n kube-system        # Calico and CoreDNS health
 ## Cleanup
 
 ```bash
-kubectl delete -f k8s/
+kubectl delete -f K8s/frontend-deployment.yaml -f K8s/frontend-svc.yaml
+kubectl delete -f K8s/backend-deployment.yaml  -f K8s/backend-svc.yaml
+kubectl delete -f K8s/database-deployment.yaml -f K8s/database-svc.yaml
+kubectl delete -f K8s/my-pvc.yaml -f K8s/my-pv.yaml
+kubectl delete -f K8s/app-config.yaml
+kubectl delete secret mysql-secret
 kubectl delete configmap mysql-init
 ```
 
-## Notes and next steps
+Deleting the PV does not wipe the data. It stays in `/mnt/data` on the node, so remove it there too for a completely fresh start.
 
-- This is a lab setup. The Flask app runs in debug mode and connects to MySQL as `root`. A production setup should use a WSGI server (Gunicorn), a dedicated database user, and resource limits.
-- Planned: a Jenkins CI/CD pipeline that builds the images, pushes them to Docker Hub, and deploys to the cluster.
+## Known limitations and next steps
+
+This is a learning project and a lab setup. These are the gaps I know about and plan to close:
+
+- [ ] Add readiness and liveness probes using the existing `/api/health` endpoint
+- [ ] Run the backend with Gunicorn instead of Flask's debug server
+- [ ] Use a dedicated database user instead of `root`
+- [ ] Replace the `hostPath` volume with a proper StorageClass (`hostPath` is tied to one node)
+- [ ] Push both images to a registry and use versioned tags instead of `latest`
+- [ ] Add resource requests and limits
+- [ ] Use connection pooling and close connections reliably in `app.py`
+- [ ] Add an Ingress in front of the frontend
+- [ ] Jenkins CI/CD pipeline that builds the images, pushes them to Docker Hub, and deploys to the cluster
 
 ## Author
 
